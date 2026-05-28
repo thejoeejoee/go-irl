@@ -9,6 +9,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -90,6 +91,8 @@ type Conn struct {
 	lastRcvd time.Time
 	recvIdx  int                     // next slot in recvLog
 	recvLog  [RecvACKInterval]uint32 // SRT sequence numbers for SRTLA ACK
+	bytes    atomic.Uint64
+	pkts     atomic.Uint64
 }
 
 type Group struct {
@@ -357,6 +360,8 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 	if len(pkt) < SRTMinLen {
 		return
 	}
+
+	metricsRecord(c, len(pkt))
 
 	// Update lastAddr only for real SRT data/control packets
 	g.mu.Lock()

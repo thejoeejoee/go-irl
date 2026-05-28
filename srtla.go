@@ -53,6 +53,21 @@ const (
 	// ext_field(2) + initial_seq(4) + mtu(4) + mfw(4) + handshake_type(4) +
 	// source_id(4) + syn_cookie(4) + peer_ip(16) = 64
 	SRTHandshakeSize = 64
+
+	// SRT handshake type field values (offset 36 from packet start)
+	SRTHSTypeInduction  = 1
+	SRTHSTypeConclusion = 0xFFFFFFFD // -3 as uint32
+
+	// Wire rejection threshold: values >= 1000 indicate rejection.
+	// Wire code = 1000 + API rejection reason.
+	SRTHSRejectionBase = 1000
+
+	// SRT handshake extension types (after base 64 bytes in CONCLUSION)
+	SRTExtHSReq  = 1
+	SRTExtHSRsp  = 2
+	SRTExtKMReq  = 3
+	SRTExtKMRsp  = 4
+	SRTExtStreamID = 5
 )
 
 func constantTimeCompare(a, b []byte) bool {
@@ -101,7 +116,8 @@ type Group struct {
 	createdAt time.Time
 	srtSock   *net.UDPConn // connection to downstream SRT server
 	lastAddr  *net.UDPAddr // most recently active client addr
-	mu        sync.Mutex   // protects conns + lastAddr + srtSock
+	streamID  string       // extracted from SRT CONCLUSION handshake
+	mu        sync.Mutex   // protects conns + lastAddr + srtSock + streamID
 }
 
 var (
@@ -143,6 +159,53 @@ func isSRTLAReg1(pkt []byte) bool {
 }
 func isSRTLAReg2(pkt []byte) bool {
 	return len(pkt) == SRTLAReg2Len && getSRTType(pkt) == SRTLATypeReg2
+}
+
+func isSRTHandshake(pkt []byte) bool {
+	return len(pkt) >= SRTHandshakeSize && getSRTType(pkt) == SRTTypeHandshake
+}
+
+func getSRTHandshakeType(pkt []byte) uint32 {
+	return binary.BigEndian.Uint32(pkt[36:40])
+}
+
+func isHandshakeRejection(pkt []byte) bool {
+	return isSRTHandshake(pkt) && getSRTHandshakeType(pkt) >= SRTHSRejectionBase
+}
+
+// extractStreamID parses SRT handshake extensions to find the StreamID (type 5).
+// Extensions appear after byte 64 in CONCLUSION handshakes as TLV blocks:
+// [2B type][2B length in 32-bit words][payload padded to 4B boundary]
+func extractStreamID(pkt []byte) string {
+	if !isSRTHandshake(pkt) {
+		return ""
+	}
+	if getSRTHandshakeType(pkt) != SRTHSTypeConclusion {
+		return ""
+	}
+
+	pos := SRTHandshakeSize
+	for pos+4 <= len(pkt) {
+		extType := binary.BigEndian.Uint16(pkt[pos : pos+2])
+		extLen := int(binary.BigEndian.Uint16(pkt[pos+2:pos+4])) * 4
+		pos += 4
+
+		if pos+extLen > len(pkt) {
+			break
+		}
+
+		if extType == SRTExtStreamID {
+			sid := pkt[pos : pos+extLen]
+			// Trim null padding
+			for len(sid) > 0 && sid[len(sid)-1] == 0 {
+				sid = sid[:len(sid)-1]
+			}
+			return string(sid)
+		}
+
+		pos += extLen
+	}
+	return ""
 }
 
 func findGroupByID(id []byte) *Group {
@@ -307,6 +370,19 @@ func handleSRTData(g *Group, pkt []byte) {
 		return
 	}
 
+	if isHandshakeRejection(pkt) {
+		reason := getSRTHandshakeType(pkt) - SRTHSRejectionBase
+		log.Printf("[group %p] SRT connection rejected (reason=%d), removing group", g, reason)
+		g.mu.Lock()
+		dst := g.lastAddr
+		g.mu.Unlock()
+		if dst != nil {
+			srtlaSock.WriteToUDP(pkt, dst)
+		}
+		removeGroup(g)
+		return
+	}
+
 	// Broadcast ACKs and NAKs to all connections so they reach the sender
 	// even if some connections are dead. Other packets go to last_address.
 	if isSRTAck(pkt) || isSRTNak(pkt) {
@@ -362,6 +438,18 @@ func handleSRTLAIncoming(pkt []byte, addr *net.UDPAddr) {
 	}
 
 	metricsRecord(c, len(pkt))
+
+	// Extract StreamID from the client's CONCLUSION handshake (once per group)
+	if isSRTHandshake(pkt) && getSRTHandshakeType(pkt) == SRTHSTypeConclusion {
+		g.mu.Lock()
+		if g.streamID == "" {
+			if sid := extractStreamID(pkt); sid != "" {
+				g.streamID = sid
+				log.Printf("[group %p] StreamID: %s", g, sid)
+			}
+		}
+		g.mu.Unlock()
+	}
 
 	// Update lastAddr only for real SRT data/control packets
 	g.mu.Lock()

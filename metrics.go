@@ -47,6 +47,7 @@ type srtlaCollector struct {
 	pathBytes      *prometheus.Desc
 	pathPackets    *prometheus.Desc
 	pathLastSeenAt *prometheus.Desc
+	groupInfo      *prometheus.Desc
 }
 
 func newSRTLACollector() *srtlaCollector {
@@ -86,6 +87,11 @@ func newSRTLACollector() *srtlaCollector {
 			"Unix timestamp of the last packet received on this path.",
 			[]string{"group", "path"}, nil,
 		),
+		groupInfo: prometheus.NewDesc(
+			"srtla_group_info",
+			"Info metric exposing group metadata. Value is always 1.",
+			[]string{"group", "stream_id"}, nil,
+		),
 	}
 }
 
@@ -97,6 +103,7 @@ func (c *srtlaCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.pathBytes
 	ch <- c.pathPackets
 	ch <- c.pathLastSeenAt
+	ch <- c.groupInfo
 }
 
 func (c *srtlaCollector) Collect(ch chan<- prometheus.Metric) {
@@ -112,11 +119,14 @@ func (c *srtlaCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, g := range snapshot {
 		g.mu.Lock()
 		groupID := hex.EncodeToString(g.id[:8])
+		streamID := g.streamID
 		conns := make([]*Conn, len(g.conns))
 		copy(conns, g.conns)
 		g.mu.Unlock()
 
 		totalConns += len(conns)
+
+		ch <- prometheus.MustNewConstMetric(c.groupInfo, prometheus.GaugeValue, 1, groupID, streamID)
 
 		for _, conn := range conns {
 			addr := conn.addr.String()

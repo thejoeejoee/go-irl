@@ -6,12 +6,33 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+func buildInfoLabels() prometheus.Labels {
+	labels := prometheus.Labels{"go_version": runtime.Version()}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return labels
+	}
+	if info.Main.Version != "" {
+		labels["version"] = info.Main.Version
+	}
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			labels["revision"] = s.Value
+		case "vcs.modified":
+			labels["modified"] = s.Value
+		}
+	}
+	return labels
+}
 
 var (
 	totalBytesReceived   atomic.Uint64
@@ -118,7 +139,7 @@ func runMetricsServer(port int) {
 		prometheus.GaugeOpts{
 			Name:        "srtla_build_info",
 			Help:        "Build information about the SRTLA server.",
-			ConstLabels: prometheus.Labels{"go_version": runtime.Version()},
+			ConstLabels: buildInfoLabels(),
 		},
 		func() float64 { return 1 },
 	))
